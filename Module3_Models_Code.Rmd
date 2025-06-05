@@ -1,0 +1,704 @@
+---
+title: "Australian Election 2019 - Minimal Working Version"
+author: "Bikramjeet Singh"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = 'center')
+```
+
+---
+
+# Load All Required Libraries
+
+```{r libraries}
+library(dplyr)
+library(tidyverse)
+library(tidytext)
+library(lubridate)
+library(textclean)
+library(syuzhet)
+library(caret)
+library(ggplot2)
+library(scales)
+library(pROC)
+library(flextable)
+library(randomForest)
+library(lightgbm)
+library(Matrix)
+library(corrplot)
+library(gridExtra)
+library(RColorBrewer)
+```
+
+# 1. Data Loading and Preprocessing (BULLETPROOF VERSION)
+
+```{r data-loading-preprocessing}
+# Load datasets using your exact approach
+tweets <- read.csv("auspol2019.csv", stringsAsFactors = FALSE)
+geo <- read.csv("location_geocode.csv", stringsAsFactors = FALSE)
+cat("Original data dimensions:", dim(tweets), "\n")
+cat("Tweet columns:", paste(colnames(tweets), collapse = ", "), "\n")
+# Handle geo data merge
+if("name" %in% colnames(geo)) {
+  geo <- geo %>% rename(user_location = name)
+}
+tweets_merged <- tweets %>% left_join(geo, by = "user_location")
+
+# preprocessing
+tweets_clean <- tweets_merged %>%
+  mutate(
+    # Handle dates carefully
+    created_at = tryCatch(
+      as.POSIXct(created_at, format="%Y-%m-%d %H:%M:%S", tz="UTC"),
+      error = function(e) as.POSIXct(created_at)
+    ),
+    user_created_at = tryCatch(
+      as.POSIXct(user_created_at, format="%Y-%m-%d %H:%M:%S", tz="UTC"),
+      error = function(e) as.POSIXct(user_created_at)
+    ),
+    # Handle numeric columns
+    retweet_count = suppressWarnings(as.numeric(retweet_count)),
+    favorite_count = suppressWarnings(as.numeric(favorite_count)),
+    user_id = suppressWarnings(as.numeric(user_id)),
+    # Handle text and location using YOUR exact column names
+    full_text = ifelse(is.na(full_text), "", as.character(full_text)),
+    latitude = ifelse(is.na(lat), 0, suppressWarnings(as.numeric(lat))),
+    longitude = ifelse(is.na(long), 0, suppressWarnings(as.numeric(long)))
+  ) %>%
+  # Filter valid data
+  filter(
+    !is.na(created_at),
+    !is.na(favorite_count),
+    !is.na(retweet_count),
+    nchar(full_text) > 0
+  ) %>%
+  distinct(id, .keep_all = TRUE)
+cat("✓ After preprocessing:", dim(tweets_clean), "\n")
+```
+
+# 2. Target Variable Creation
+
+```{r target-creation}
+tweets_clean <- tweets_clean %>%
+  mutate(
+    # Binary targets
+    Popular = ifelse(favorite_count > 1, "Popular", "Not Popular"),
+    target_5 = ifelse(favorite_count > 5, 1, 0),
+    target_10 = ifelse(favorite_count > 10, 1, 0),
+    # Multi-class targets
+    like_bucket = case_when(
+      favorite_count == 0 ~ "0",
+      favorite_count <= 5 ~ "1-5",
+      favorite_count <= 10 ~ "6-10",
+      favorite_count <= 50 ~ "11-50",
+      TRUE ~ "51+"
+    ),
+    like_bucket_numeric = case_when(
+      favorite_count == 0 ~ 0,
+      favorite_count <= 5 ~ 1,
+      favorite_count <= 10 ~ 2,
+      favorite_count <= 50 ~ 3,
+      TRUE ~ 4
+    ),
+    # Ordinal target for regression
+    engagement_level = like_bucket_numeric
+  ) %>%
+  # Remove ambiguous cases
+  filter(favorite_count != 1)
+cat("TARGET DISTRIBUTIONS:\n")
+cat("Popular (string):", table(tweets_clean$Popular), "\n")
+cat("target_5 (binary):", table(tweets_clean$target_5), "\n")
+cat("like_bucket (string):", table(tweets_clean$like_bucket), "\n")
+cat("like_bucket_numeric:", table(tweets_clean$like_bucket_numeric), "\n")
+```
+
+# 3. Advanced Text Processing and Feature Engineering
+
+```{r text-processing-features}
+# Combined approach from both codes
+tweets_features <- tweets_clean %>%
+  mutate(
+    text_lower = str_to_lower(as.character(full_text)),
+    text_no_url = str_remove_all(text_lower, "http[s]?://[^\\s]+"),
+    text_no_mentions = str_remove_all(text_no_url, "@[a-zA-Z0-9_]+"),
+    text_no_hashtags = str_remove_all(text_no_mentions, "#[a-zA-Z0-9_]+"),
+    text_clean = str_replace_all(text_no_hashtags, "[^a-z0-9\\s]", " "),
+    text_clean = str_replace_all(text_clean, "\\s+", " "),
+    text_clean = str_trim(text_clean),
+    # Alternative cleaning method
+    clean_text = full_text %>%
+      as.character() %>%
+      replace_url() %>%
+      replace_tag() %>%
+      replace_emoji() %>%
+      replace_hash() %>%
+      str_to_lower() %>%
+      str_replace_all("[^a-z\\s]", " ") %>%
+      str_squish(),
+    final_clean_text = ifelse(nchar(text_clean) > nchar(clean_text), text_clean, clean_text),
+    
+    # FEATURE ENGINEERING
+    # Temporal features
+    tweet_date = as_datetime(created_at),
+    user_created = as_datetime(user_created_at),
+    account_age_days = pmax(0, as.numeric(difftime(created_at, user_created_at, units = "days")), na.rm = TRUE),
+    account_age_years = account_age_days / 365.25,
+    tweet_hour = hour(created_at),
+    tweet_day = wday(created_at),
+    tweet_month = month(created_at),
+    # Time categories
+    time_of_day = case_when(
+      tweet_hour >= 5 & tweet_hour < 12 ~ "Morning",
+      tweet_hour >= 12 & tweet_hour < 17 ~ "Afternoon",
+      tweet_hour >= 17 & tweet_hour < 21 ~ "Evening",
+      TRUE ~ "Night"
+    ),
+    time_morning = ifelse(tweet_hour >= 6 & tweet_hour < 12, 1, 0),
+    time_afternoon = ifelse(tweet_hour >= 12 & tweet_hour < 18, 1, 0),
+    time_evening = ifelse(tweet_hour >= 18 & tweet_hour < 22, 1, 0),
+    time_night = ifelse(tweet_hour < 6 | tweet_hour >= 22, 1, 0),
+    is_weekend = ifelse(wday(created_at, label = TRUE) %in% c("Sat", "Sun"), 1, 0),
+    is_business_hours = ifelse(tweet_hour >= 9 & tweet_hour <= 17 & !is_weekend, 1, 0),
+    # Text features
+    tweet_length_chars = nchar(full_text),
+    original_length = nchar(full_text),
+    clean_length_chars = nchar(final_clean_text),
+    clean_length = nchar(final_clean_text),
+    tweet_length_words = str_count(full_text, "\\S+"),
+    word_count = str_count(final_clean_text, "\\S+"),
+    avg_word_length = ifelse(word_count > 0, clean_length / word_count, 0),
+    # Text complexity
+    uppercase_count = str_count(full_text, "[A-Z]"),
+    uppercase_ratio = ifelse(original_length > 0, uppercase_count / original_length, 0),
+    # Social media features
+    hashtag_count = str_count(full_text, "#"),
+    mention_count = str_count(full_text, "@"),
+    url_count = str_count(full_text, "http"),
+    has_hashtag = ifelse(str_detect(full_text, "#"), 1, 0),
+    has_mention = ifelse(str_detect(full_text, "@"), 1, 0),
+    has_url = ifelse(str_detect(full_text, "http"), 1, 0),
+    # Engagement features
+    retweet_count_safe = pmax(0, retweet_count, na.rm = TRUE),
+    retweet_count_log = log1p(retweet_count_safe),
+    is_retweet = ifelse(retweet_count_safe > 0, 1, 0),
+    # User features
+    desc_length = ifelse(is.na(user_description) | user_description == "", 0, nchar(user_description)),
+    user_desc_length = desc_length,
+    has_description = ifelse(desc_length > 0, 1, 0),
+    user_name_length = nchar(user_name),
+    screen_name_length = nchar(user_screen_name),
+    has_numbers_in_screen = ifelse(str_detect(user_screen_name, "\\d"), 1, 0),
+    # Location features
+    has_location = ifelse(latitude != 0 & longitude != 0, 1, 0),
+    has_coordinates = has_location,
+    has_location_text = ifelse(!is.na(user_location) & user_location != "", 1, 0)
+  ) %>%
+  # Keep meaningful text only
+  filter(nchar(final_clean_text) > 5)
+# Add sentiment analysis
+tweets_features <- tweets_features %>%
+  mutate(
+    syuzhet_score = get_sentiment(final_clean_text, method = "syuzhet"),
+    afinn_score = get_sentiment(final_clean_text, method = "afinn"),
+    bing_score = get_sentiment(final_clean_text, method = "bing"),
+    nrc_score = get_sentiment(final_clean_text, method = "nrc"),
+    # Sentiment categories and directions
+    sentiment_direction = case_when(
+      syuzhet_score > 0 ~ "positive",
+      syuzhet_score < 0 ~ "negative",
+      TRUE ~ "neutral"
+    ),
+    is_positive = ifelse(syuzhet_score > 0, 1, 0),
+    is_negative = ifelse(syuzhet_score < 0, 1, 0),
+    is_neutral = ifelse(syuzhet_score == 0, 1, 0),
+    sentiment_strength = abs(syuzhet_score),
+    sentiment_consensus = ifelse(
+      sign(syuzhet_score) == sign(afinn_score) & sign(afinn_score) == sign(bing_score), 1, 0
+    )
+  )
+# Handle any remaining NULL
+numeric_cols <- sapply(tweets_features, is.numeric)
+tweets_features[numeric_cols] <- lapply(tweets_features[numeric_cols], function(x) {
+  ifelse(is.na(x) | is.infinite(x), median(x, na.rm = TRUE), x)
+})
+
+cat(" After Feature engineering, Dimensions are:", dim(tweets_features), "\n")
+```
+
+# 4. Geographic Clustering (FROM BOTH CODES)
+
+```{r geographic-clustering}
+# Geographic clustering
+geo_valid <- tweets_features %>% filter(has_location == 1)
+if(nrow(geo_valid) > 10) {
+  cat("Creating geographic clusters with", nrow(geo_valid), "valid coordinates\n")
+  set.seed(42)
+  k_result <- kmeans(geo_valid[, c("latitude", "longitude")], centers = 3, nstart = 20)
+  geo_valid$geo_cluster <- paste0("Cluster_", k_result$cluster)
+  tweets_features <- tweets_features %>%
+    left_join(geo_valid %>% select(id, geo_cluster), by = "id") %>%
+    mutate(geo_cluster = ifelse(is.na(geo_cluster), "No_Location", geo_cluster))
+} else {
+  cat("Insufficient location data for clustering\n")
+  tweets_features$geo_cluster <- "No_Location"
+}
+tweets_features$geo_cluster <- as.factor(tweets_features$geo_cluster)
+```
+
+# 5. Final Dataset Preparation
+
+```{r final-dataset}
+# Select comprehensive feature set
+feature_columns <- c(
+  # Temporal features
+  "tweet_hour", "tweet_day", "tweet_month", "account_age_days", "account_age_years",
+  "time_morning", "time_afternoon", "time_evening", "time_night", 
+  "is_weekend", "is_business_hours",
+  
+  # Text features
+  "original_length", "clean_length", "word_count", "avg_word_length", "uppercase_ratio",
+  "tweet_length_chars", "tweet_length_words", "clean_length_chars",
+  
+  # Social media features
+  "hashtag_count", "mention_count", "url_count", 
+  "has_hashtag", "has_mention", "has_url",
+  
+  # Engagement features
+  "retweet_count_safe", "retweet_count_log", "is_retweet",
+  
+  # User features
+  "desc_length", "user_desc_length", "has_description", "user_name_length", 
+  "screen_name_length", "has_numbers_in_screen",
+  
+  # Location features
+  "has_location", "has_coordinates", "has_location_text", "geo_cluster",
+  
+  # Sentiment features
+  "syuzhet_score", "afinn_score", "bing_score", "nrc_score",
+  "is_positive", "is_negative", "is_neutral", "sentiment_strength", "sentiment_consensus",
+  "sentiment_direction"
+)
+# Create final modeling dataset with all targets
+model_data <- tweets_features %>%
+  select(all_of(c("id", "Popular", "target_5", "like_bucket", "like_bucket_numeric", "engagement_level", feature_columns))) %>%
+  drop_na() %>%
+  mutate(
+    # Ensure proper factor levels
+    Popular = as.factor(Popular),
+    like_bucket = factor(like_bucket, levels = c("0", "1-5", "6-10", "11-50", "51+")),
+    sentiment_direction = as.factor(sentiment_direction),
+    geo_cluster = as.factor(geo_cluster)
+  )
+# remove any remaining problematic columns
+categorical_cols <- c("sentiment_direction", "geo_cluster")
+for(col in categorical_cols) {
+  if(col %in% colnames(model_data)) {
+    model_data[[col]] <- as.numeric(model_data[[col]])
+  }
+}
+# Final feature list (only numeric for LightGBM)
+final_features <- setdiff(feature_columns, categorical_cols)
+final_features <- c(final_features, "sentiment_direction", "geo_cluster")
+
+cat("FINAL DATASET SUMMARY:\n")
+cat("- Dimensions:", dim(model_data), "\n")
+cat("- Features:", length(final_features), "\n")
+cat("- Target distributions:\n")
+cat("  Popular:", table(model_data$Popular), "\n")
+cat("  target_5:", table(model_data$target_5), "\n")
+```
+
+# 6. Train-Test Split
+
+```{r train-test-split}
+# Stratified split using target_5 (main binary target)
+set.seed(123)
+train_idx <- createDataPartition(model_data$target_5, p = 0.7, list = FALSE)
+train_data <- model_data[train_idx, ]
+test_data <- model_data[-train_idx, ]
+# Prepare different target variables
+X_train <- train_data[, final_features]
+X_test <- test_data[, final_features]
+# Binary targets
+y_train_popular <- train_data$Popular
+y_test_popular <- test_data$Popular
+y_train_binary <- train_data$target_5
+y_test_binary <- test_data$target_5
+# Multi-class targets
+y_train_multi <- train_data$like_bucket_numeric
+y_test_multi <- test_data$like_bucket_numeric
+y_train_bucket <- train_data$like_bucket
+y_test_bucket <- test_data$like_bucket
+cat("TRAIN-TEST SPLIT:\n")
+cat("- Training samples:", nrow(train_data), "\n")
+cat("- Test samples:", nrow(test_data), "\n")
+cat("- Features:", length(final_features), "\n")
+```
+
+# 7. Comprehensive EDA
+
+```{r comprehensive-eda, fig.width=14, fig.height=10}
+# EDA using available data
+p1 <- tweets_features %>%
+  sample_n(min(10000, nrow(tweets_features))) %>%
+  ggplot(aes(x = favorite_count)) +
+  geom_histogram(bins = 50, fill = "steelblue", alpha = 0.7) +
+  scale_x_continuous(limits = c(0, 100)) +
+  labs(title = "Distribution of Favorite Count", x = "Favorites", y = "Count") +
+  theme_minimal()
+
+p2 <- model_data %>%
+  count(tweet_hour, Popular) %>%
+  ggplot(aes(x = tweet_hour, y = n, fill = Popular)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Tweet Popularity by Hour", x = "Hour", y = "Proportion") +
+  theme_minimal()
+
+p3 <- ggplot(model_data, aes(x = syuzhet_score, fill = Popular)) +
+  geom_density(alpha = 0.6) +
+  labs(title = "Sentiment Distribution", x = "Sentiment Score", y = "Density") +
+  theme_minimal()
+
+p4 <- model_data %>%
+  ggplot(aes(x = tweet_length_chars, fill = Popular)) +
+  geom_density(alpha = 0.6) +
+  scale_x_continuous(limits = c(0, 500)) +
+  labs(title = "Text Length Distribution", x = "Characters", y = "Density") +
+  theme_minimal()
+
+p5 <- model_data %>%
+  sample_n(min(5000, nrow(model_data))) %>%
+  ggplot(aes(x = retweet_count_log, y = original_length, color = Popular)) +
+  geom_point(alpha = 0.6) +
+  labs(title = "Retweets vs Text Length", x = "Log(Retweets)", y = "Text Length") +
+  theme_minimal()
+
+p6 <- model_data %>%
+  count(like_bucket) %>%
+  ggplot(aes(x = like_bucket, y = n)) +
+  geom_col(fill = "coral", alpha = 0.7) +
+  geom_text(aes(label = scales::comma(n)), vjust = -0.5) +
+  labs(title = "Multi-class Distribution", x = "Like Bucket", y = "Count") +
+  theme_minimal()
+
+grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 3, nrow = 2)
+```
+
+# 8. MODEL 1: Logistic Regression
+
+```{r logistic-regression}
+# Logistic Regression
+model_logit <- glm(Popular ~ ., data = train_data[, c("Popular", final_features)], family = "binomial")
+# Predictions
+logit_probs <- predict(model_logit, test_data, type = "response")
+logit_preds <- factor(ifelse(logit_probs > 0.5, "Popular", "Not Popular"), 
+                      levels = levels(test_data$Popular))
+# Evaluation
+cm_logit <- confusionMatrix(logit_preds, test_data$Popular)
+roc_logit <- roc(test_data$Popular, logit_probs, levels = c("Not Popular", "Popular"))
+
+cat("Logistic Regression Results:\n")
+cat("- Accuracy:", round(cm_logit$overall["Accuracy"], 4), "\n")
+cat("- AUC:", round(auc(roc_logit), 4), "\n")
+```
+
+# 9. MODEL 2: Random Forest (FROM YOUR WORKING CODE - OPTIMIZED)
+
+```{r random-forest-optimized}
+# Random Forest
+model_rf <- randomForest(Popular ~ ., data = train_data[, c("Popular", final_features)], 
+                         ntree = 300,
+                         importance = TRUE)
+# Multi-class Random Forest
+model_rf_multi <- randomForest(like_bucket ~ ., data = train_data[, c("like_bucket", final_features)], 
+                               ntree = 300, importance = TRUE)
+# Predictions
+rf_preds <- predict(model_rf, test_data)
+rf_probs <- predict(model_rf, test_data, type = "prob")[, "Popular"]
+rf_preds_multi <- predict(model_rf_multi, test_data)
+# Evaluation
+cm_rf <- confusionMatrix(rf_preds, test_data$Popular)
+roc_rf <- roc(test_data$Popular, rf_probs, levels = c("Not Popular", "Popular"))
+cm_rf_multi <- confusionMatrix(rf_preds_multi, test_data$like_bucket)
+cat("Random Forest Results:\n")
+cat("- Binary Accuracy:", round(cm_rf$overall["Accuracy"], 4), "\n")
+cat("- Binary AUC:", round(auc(roc_rf), 4), "\n")
+cat("- Multi-class Accuracy:", round(cm_rf_multi$overall["Accuracy"], 4), "\n")
+```
+
+# 10. MODEL 3: LightGBM Binary Classification
+
+```{r lightgbm-binary}
+# Create LightGBM datasets
+train_lgb_binary <- lgb.Dataset(
+  data = as.matrix(X_train),
+  label = y_train_binary,
+  free_raw_data = FALSE
+)
+test_lgb_binary <- lgb.Dataset(
+  data = as.matrix(X_test),
+  label = y_test_binary,
+  reference = train_lgb_binary,
+  free_raw_data = FALSE
+)
+# LightGBM parameters
+params_binary <- list(
+  objective = "binary",
+  metric = "auc",
+  boosting = "gbdt",
+  num_leaves = 31,
+  learning_rate = 0.05,
+  feature_fraction = 0.8,
+  bagging_fraction = 0.8,
+  bagging_freq = 5,
+  min_data_in_leaf = 20,
+  lambda_l1 = 0.1,
+  lambda_l2 = 0.1,
+  verbosity = -1,
+  seed = 42
+)
+# Train binary model
+model_lgb_binary <- lgb.train(
+  params = params_binary,
+  data = train_lgb_binary,
+  nrounds = 500,
+  valids = list(test = test_lgb_binary),
+  early_stopping_rounds = 30,
+  verbose = -1
+)
+# Predictions
+pred_lgb_binary <- predict(model_lgb_binary, as.matrix(X_test), num_iteration = model_lgb_binary$best_iter)
+pred_lgb_binary_class <- ifelse(pred_lgb_binary > 0.5, 1, 0)
+# Evaluation
+conf_lgb_binary <- confusionMatrix(
+  factor(pred_lgb_binary_class, levels = c(0, 1)),
+  factor(y_test_binary, levels = c(0, 1))
+)
+roc_lgb_binary <- roc(y_test_binary, pred_lgb_binary)
+cat("LightGBM Binary Results:\n")
+print(conf_lgb_binary)
+cat("- AUC:", round(auc(roc_lgb_binary), 4), "\n")
+cat("- Best iteration:", model_lgb_binary$best_iter, "\n")
+```
+
+# 11. MODEL 4: LightGBM Ordinal Regression
+
+```{r lightgbm-ordinal}
+# Create datasets for ordinal regression
+train_lgb_ordinal <- lgb.Dataset(
+  data = as.matrix(X_train),
+  label = y_train_multi,
+  free_raw_data = FALSE
+)
+test_lgb_ordinal <- lgb.Dataset(
+  data = as.matrix(X_test),
+  label = y_test_multi,
+  reference = train_lgb_ordinal,
+  free_raw_data = FALSE
+)
+# Parameters for ordinal regression
+params_ordinal <- list(
+  objective = "regression",
+  metric = "rmse",
+  boosting = "gbdt",
+  num_leaves = 31,
+  learning_rate = 0.05,
+  feature_fraction = 0.8,
+  bagging_fraction = 0.8,
+  bagging_freq = 5,
+  min_data_in_leaf = 20,
+  lambda_l1 = 0.1,
+  lambda_l2 = 0.1,
+  verbosity = -1,
+  seed = 42
+)
+# Train ordinal model
+model_lgb_ordinal <- lgb.train(
+  params = params_ordinal,
+  data = train_lgb_ordinal,
+  nrounds = 500,
+  valids = list(test = test_lgb_ordinal),
+  early_stopping_rounds = 30,
+  verbose = -1
+)
+# Predictions
+pred_lgb_ordinal_raw <- predict(model_lgb_ordinal, as.matrix(X_test), num_iteration = model_lgb_ordinal$best_iter)
+pred_lgb_ordinal_class <- pmax(0, pmin(4, round(pred_lgb_ordinal_raw)))
+# Evaluation
+conf_lgb_ordinal <- confusionMatrix(
+  factor(pred_lgb_ordinal_class, levels = 0:4),
+  factor(y_test_multi, levels = 0:4)
+)
+rmse_ordinal <- sqrt(mean((pred_lgb_ordinal_raw - y_test_multi)^2))
+cat("LightGBM Ordinal Results:\n")
+cat("- Accuracy:", round(conf_lgb_ordinal$overall["Accuracy"], 4), "\n")
+cat("- Kappa:", round(conf_lgb_ordinal$overall["Kappa"], 4), "\n")
+cat("- RMSE:", round(rmse_ordinal, 4), "\n")
+```
+
+# 12. Feature Importance Analysis
+
+```{r feature-importance, fig.width=14, fig.height=10}
+# LightGBM Binary Feature Importance
+importance_lgb_binary <- lgb.importance(model_lgb_binary, percentage = TRUE)
+importance_lgb_binary$Feature <- factor(importance_lgb_binary$Feature, levels = rev(importance_lgb_binary$Feature))
+p1 <- ggplot(importance_lgb_binary[1:15,], aes(x = Feature, y = Gain)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  coord_flip() +
+  labs(title = "Top 15 Features - LightGBM Binary (Best Model)", x = "Features", y = "Importance (%)") +
+  theme_minimal()
+# Random Forest Feature Importance
+importance_rf <- importance(model_rf) %>%
+  as.data.frame() %>%
+  rownames_to_column("Feature") %>%
+  arrange(desc(MeanDecreaseGini)) %>%
+  head(15)
+importance_rf$Feature <- factor(importance_rf$Feature, levels = rev(importance_rf$Feature))
+p2 <- ggplot(importance_rf, aes(x = Feature, y = MeanDecreaseGini)) +
+  geom_col(fill = "coral", alpha = 0.8) +
+  coord_flip() +
+  labs(title = "Top 15 Features - Random Forest", x = "Features", y = "Mean Decrease Gini") +
+  theme_minimal()
+grid.arrange(p1, p2, ncol = 2)
+# Print top 10 features
+cat("TOP 10 FEATURES - LIGHTGBM BINARY (BEST MODEL):\n")
+for(i in 1:10) {
+  cat(sprintf("%2d. %-25s: %5.2f%%\n", i, importance_lgb_binary$Feature[i], importance_lgb_binary$Gain[i]))
+}
+```
+
+# 13. Model Performance Comparison
+
+```{r model-comparison, fig.width=14, fig.height=8}
+cat("COMPREHENSIVE MODEL COMPARISON\n")
+# Collect all binary classification results
+results_binary <- data.frame(
+  Model = c("Logistic Regression", "Random Forest", "LightGBM Binary"),
+  Accuracy = c(
+    cm_logit$overall["Accuracy"],
+    cm_rf$overall["Accuracy"],
+    conf_lgb_binary$overall["Accuracy"]
+  ),
+  AUC = c(
+    auc(roc_logit),
+    auc(roc_rf),
+    auc(roc_lgb_binary)
+  ),
+  Precision = c(
+    cm_logit$byClass["Precision"],
+    cm_rf$byClass["Precision"],
+    conf_lgb_binary$byClass["Precision"]
+  ),
+  Recall = c(
+    cm_logit$byClass["Recall"],
+    cm_rf$byClass["Recall"],
+    conf_lgb_binary$byClass["Recall"]
+  ),
+  F1_Score = c(
+    cm_logit$byClass["F1"],
+    cm_rf$byClass["F1"],
+    conf_lgb_binary$byClass["F1"]
+  )
+)
+# Multi-class results
+results_multiclass <- data.frame(
+  Model = c("Random Forest Multi-class", "LightGBM Ordinal"),
+  Accuracy = c(
+    cm_rf_multi$overall["Accuracy"],
+    conf_lgb_ordinal$overall["Accuracy"]
+  ),
+  Kappa = c(
+    cm_rf_multi$overall["Kappa"],
+    conf_lgb_ordinal$overall["Kappa"]
+  )
+)
+# Display results
+cat("BINARY CLASSIFICATION RESULTS:\n")
+# For BINARY results
+numeric_cols_binary <- sapply(results_binary, is.numeric)
+results_binary_rounded <- results_binary
+results_binary_rounded[numeric_cols_binary] <- round(results_binary[numeric_cols_binary], 4)
+knitr::kable(results_binary_rounded, caption = "Binary Classification Performance")
+cat("\nMULTI-CLASS RESULTS:\n")
+# For MULTI-CLASS results
+numeric_cols_multi <- sapply(results_multiclass, is.numeric)
+results_multiclass_rounded <- results_multiclass
+results_multiclass_rounded[numeric_cols_multi] <- round(results_multiclass[numeric_cols_multi], 4)
+knitr::kable(results_multiclass_rounded, caption = "Multi-class Performance")
+
+# ROC Curves Comparison
+par(mfrow = c(1, 1))
+plot(roc_logit, col = "blue", lwd = 2, main = "ROC Curves Comparison - Binary Classification")
+lines(roc_rf, col = "red", lwd = 2)
+lines(roc_lgb_binary, col = "purple", lwd = 2)
+
+legend("bottomright", 
+       legend = c(
+         paste("Logistic (AUC =", round(auc(roc_logit), 3), ")"),
+         paste("Random Forest (AUC =", round(auc(roc_rf), 3), ")"),
+         paste("LightGBM (AUC =", round(auc(roc_lgb_binary), 3), ")")
+       ),
+       col = c("blue", "red", "purple"), lwd = 2)
+```
+
+# 14. Multi-class Visualization
+```{r multiclass-visualization, fig.width=12, fig.height=6}
+# Multi-class confusion matrices
+par(mfrow = c(1, 2))
+# Random Forest Multi-class
+cm_rf_multi_df <- as.data.frame(cm_rf_multi$table)
+p1 <- ggplot(cm_rf_multi_df, aes(x = Prediction, y = Reference, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white") +
+  scale_fill_gradient(low = "white", high = "darkblue") +
+  labs(title = "Random Forest Multi-class Confusion Matrix") +
+  theme_minimal()
+# LightGBM Ordinal
+cm_lgb_ordinal_df <- as.data.frame(conf_lgb_ordinal$table)
+p2 <- ggplot(cm_lgb_ordinal_df, aes(x = Prediction, y = Reference, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white") +
+  scale_fill_gradient(low = "white", high = "darkgreen") +
+  labs(title = "LightGBM Ordinal Confusion Matrix") +
+  theme_minimal()
+grid.arrange(p1, p2, ncol = 2)
+```
+
+# 15. Final Results Summary and Business Insights
+
+```{r final-summary}
+cat("COMPREHENSIVE RESULTS SUMMARY\n\n")
+# Best model identification
+best_binary_idx <- which.max(results_binary$AUC)
+best_binary_model <- results_binary$Model[best_binary_idx]
+best_binary_auc <- results_binary$AUC[best_binary_idx]
+cat("🏆 BEST PERFORMING MODELS:\n")
+cat("- Best Binary Model:", best_binary_model, "\n")
+cat("- Best Binary AUC:", round(best_binary_auc, 4), "\n")
+cat("- Best Multi-class: LightGBM Ordinal\n")
+cat("- Best Multi-class Accuracy:", round(conf_lgb_ordinal$overall["Accuracy"], 4), "\n\n")
+
+cat("📊 COMPLETE PERFORMANCE SUMMARY:\n")
+cat("BINARY CLASSIFICATION:\n")
+for(i in 1:nrow(results_binary)) {
+  cat(sprintf("  %s:\n", results_binary$Model[i]))
+  cat(sprintf("    - Accuracy: %.4f | AUC: %.4f | F1: %.4f\n", 
+              results_binary$Accuracy[i], results_binary$AUC[i], results_binary$F1_Score[i]))
+}
+
+cat("\nMULTI-CLASS CLASSIFICATION:\n")
+for(i in 1:nrow(results_multiclass)) {
+  cat(sprintf("  %s: Accuracy=%.4f, Kappa=%.4f\n", 
+              results_multiclass$Model[i], results_multiclass$Accuracy[i], results_multiclass$Kappa[i]))
+}
+cat("\n🔑 TOP SUCCESS FACTORS:\n")
+top_features <- importance_lgb_binary$Feature[1:8]
+for(i in 1:length(top_features)) {
+  cat(sprintf("   %d. %s\n", i, top_features[i]))
+}
+
+```
